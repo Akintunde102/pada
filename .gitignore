@@ -1,0 +1,25 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Large model checkpoints, weights, and archives
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+*.zip
+
+# IDE configurations
+.idea/
+.vscode/
+.qodo/
+
+# Operating system files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jev — Probing & Sample Studio</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --panel: #f9fafb;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --card-bg: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f172a;
+        --text: #f1f5f9;
+        --muted: #94a3b8;
+        --border: #334155;
+        --panel: #1e293b;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --card-bg: #1e293b;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 32px 16px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+    p.sub { font-size: 13px; color: var(--muted); margin-bottom: 24px; }
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+    .grid-samples {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .sample-chip {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      text-align: left;
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    .sample-chip:hover {
+      border-color: var(--accent);
+      background: var(--panel);
+    }
+    .sample-chip b { display: block; font-size: 12px; color: var(--accent); margin-bottom: 2px; }
+    .sample-chip span { color: var(--muted); font-size: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+    textarea, input[type="text"] {
+      width: 100%;
+      font-family: inherit;
+      font-size: 14px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card-bg);
+      color: var(--text);
+      outline: none;
+      margin-bottom: 12px;
+    }
+    textarea:focus, input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+    textarea { resize: vertical; min-height: 90px; }
+
+    .row { display: flex; gap: 8px; align-items: center; }
+    button {
+      background: var(--accent);
+      color: #ffffff;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { background: var(--border); }
+
+    /* Results layout */
+    .output-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 12px;
+    }
+    @media (max-width: 600px) {
+      .output-grid { grid-template-columns: 1fr; }
+    }
+    .res-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .res-label { font-size: 11px; text-transform: uppercase; font-weight: 700; color: var(--muted); margin-bottom: 4px; }
+    .res-val { font-size: 20px; font-weight: 700; color: var(--text); }
+    .res-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    .meta-bar {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 12px;
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid var(--border);
+      padding-top: 8px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Jev AI Prober</h1>
+  <p class="sub">Minimal test bench for calibrated probabilities, multiple choice &amp; ratings with instant KV cache.</p>
+
+  <!-- 1. SAMPLES & GENERATOR -->
+  <div class="section-title">1. Choose a Sample or Generate with Qwen</div>
+  <div class="box">
+    <!-- Clickable Pre-loaded Samples -->
+    <div class="grid-samples" id="sample-list">
+      <!-- Injected by JS -->
+    </div>
+
+    <!-- Generator Row -->
+    <div class="row">
+      <input type="text" id="gen-prompt" placeholder="Or ask Qwen: e.g. Write a 2-star review about cold soup..." style="margin-bottom: 0;">
+      <button id="btn-gen" onclick="generateSample()">Generate &amp; Import</button>
+    </div>
+  </div>
+
+  <!-- 2. TEST INPUT -->
+  <div class="section-title">2. Input Context (&lt;|state|&gt;)</div>
+  <div class="box">
+    <textarea id="state-text" placeholder="Type or paste any text here to test..."></textarea>
+    
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <button onclick="toggleAdvanced()" class="btn-secondary" style="font-size: 12px; padding: 6px 10px;">
+        ⚙️ Customize Questions
+      </button>
+      <button id="btn-eval" onclick="runJevEval()" style="padding: 10px 24px; font-size: 14px;">
+        Evaluate Input
+      </button>
+    </div>
+
+    <!-- Advanced Questions (Hidden by default to keep it super clean) -->
+    <div id="advanced-box" style="display: none; margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px;">
+      <div style="font-size: 12px; color: var(--muted); margin-bottom: 8px;">Questions evaluated simultaneously in single forward pass:</div>
+      <label style="font-size: 12px; font-weight: 600;">Yes/No Question:</label>
+      <input type="text" id="q-noul" value="Is this customer review positive?">
+      <label style="font-size: 12px; font-weight: 600;">Category Question:</label>
+      <input type="text" id="q-choice" value="What is the overall sentiment tier of this review?">
+      <label style="font-size: 12px; font-weight: 600;">Candidate Options (comma-separated):</label>
+      <input type="text" id="q-opts" value="Negative Review, Neutral Review, Positive Review">
+      <label style="font-size: 12px; font-weight: 600;">Rating Question:</label>
+      <input type="text" id="q-score" value="Rate overall satisfaction from 1 to 5:">
+    </div>
+  </div>
+
+  <!-- 3. RESULTS OUTPUT -->
+  <div class="section-title">3. Evaluation Output</div>
+  <div class="box" id="result-box">
+    <div style="color: var(--muted); font-size: 13px; text-align: center; padding: 16px;">
+      Click any sample above or press <b>Evaluate Input</b> to see results.
+    </div>
+  </div>
+
+  <script>
+    const SAMPLES = [
+      {
+        tag: "5-Star Praise",
+        text: "Absolutely incredible quality! Best purchase I have made all year. Highly recommend to everyone!",
+        noul: "Is this customer review positive?",
+        choice: "What is the overall sentiment tier of this review?",
+        opts: "Negative Review, Neutral Review, Positive Review",
+        score: "Rate overall satisfaction from 1 to 5:"
+      },
+      {
+        tag: "1-Star Broken",
+        text: "Completely useless junk. It stopped working after 10 minutes and customer service refused to help.",
+        noul: "Is this customer review positive?",
+        choice: "What is the overall sentiment tier of this review?",
+        opts: "Negative Review, Neutral Review, Positive Review",
+        score: "Rate overall satisfaction from 1 to 5:"
+      },
+      {
+        tag: "3-Star Neutral",
+        text: "It is okay for the price. Works as expected, nothing fancy or special.",
+        noul: "Is this customer review positive?",
+        choice: "What is the overall sentiment tier of this review?",
+        opts: "Negative Review, Neutral Review, Positive Review",
+        score: "Rate overall satisfaction from 1 to 5:"
+      },
+      {
+        tag: "Contrastive Nuance",
+        text: "The item arrived on time and does the basic job, just average overall.",
+        noul: "Is this customer review positive?",
+        choice: "What is the overall sentiment tier of this review?",
+        opts: "Negative Review, Neutral Review, Positive Review",
+        score: "Rate overall satisfaction from 1 to 5:"
+      },
+      {
+        tag: "Medical Triage",
+        text: "Patient has a small mole that changed color slightly, no other symptoms.",
+        noul: "Does this patient require immediate emergency intervention?",
+        choice: "Which medical unit should receive this patient?",
+        opts: "Cardiology / ER, Dermatology, Routine Checkup, Dental",
+        score: "Rate clinical severity from 1 to 5:"
+      },
+      {
+        tag: "Fraud Screening",
+        text: "Account created 90 seconds ago via VPN, ordering six $500 digital gift cards with a foreign prepaid card.",
+        noul: "Should we block this transaction for fraud?",
+        choice: "What is the primary risk category?",
+        opts: "Payment Fraud, Friendly Return, Shipping Delay",
+        score: "Rate fraud risk level from 1 to 5:"
+      }
+    ];
+
+    // Render sample buttons
+    const sampleList = document.getElementById('sample-list');
+    SAMPLES.forEach((s, idx) => {
+      const btn = document.createElement('div');
+      btn.className = 'sample-chip';
+      btn.innerHTML = `<b>${s.tag}</b><span>${s.text}</span>`;
+      btn.onclick = () => selectSample(idx);
+      sampleList.appendChild(btn);
+    });
+
+    function selectSample(idx) {
+      const s = SAMPLES[idx];
+      document.getElementById('state-text').value = s.text;
+      document.getElementById('q-noul').value = s.noul;
+      document.getElementById('q-choice').value = s.choice;
+      document.getElementById('q-opts').value = s.opts;
+      document.getElementById('q-score').value = s.score;
+      runJevEval();
+    }
+
+    function toggleAdvanced() {
+      const el = document.getElementById('advanced-box');
+      el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+    }
+
+    async function generateSample() {
+      const prompt = document.getElementById('gen-prompt').value.trim();
+      if (!prompt) return;
+
+      const btn = document.getElementById('btn-gen');
+      btn.disabled = true;
+      btn.innerText = "Qwen is writing...";
+
+      try {
+        const res = await fetch('/api/generate_sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+        const data = await res.json();
+        if (data.sample) {
+          document.getElementById('state-text').value = data.sample;
+          runJevEval();
+        }
+      } catch (e) {
+        alert("Generation error: " + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "Generate & Import";
+      }
+    }
+
+    async function runJevEval() {
+      const text = document.getElementById('state-text').value.trim();
+      if (!text) return;
+
+      const btn = document.getElementById('btn-eval');
+      btn.disabled = true;
+      btn.innerText = "Evaluating...";
+
+      const noulQ = document.getElementById('q-noul').value.trim();
+      const choiceQ = document.getElementById('q-choice').value.trim();
+      const opts = document.getElementById('q-opts').value.split(',').map(s => s.trim()).filter(Boolean);
+      const scoreQ = document.getElementById('q-score').value.trim();
+
+      try {
+        const res = await fetch('/api/evaluate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            state: text,
+            noul_question: noulQ,
+            choice_question: choiceQ,
+            options: opts,
+            score_question: scoreQ
+          })
+        });
+
+        const d = await res.json();
+        renderOutput(d);
+      } catch (e) {
+        alert("Evaluation error: " + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "Evaluate Input";
+      }
+    }
+
+    function renderOutput(d) {
+      const box = document.getElementById('result-box');
+
+      const noulPct = (d.noul_prob * 100).toFixed(1);
+      const choiceTop = `${d.choice_winner} (${(d.choice_winner_prob * 100).toFixed(0)}%)`;
+      const scoreVal = d.expected_rating.toFixed(2);
+
+      // Simple text-first layout
+      box.innerHTML = `
+        <div class="output-grid">
+          <div class="res-card">
+            <div class="res-label">Yes / No Prob</div>
+            <div class="res-val">${noulPct}%</div>
+            <div class="res-sub">Question 1</div>
+          </div>
+          <div class="res-card">
+            <div class="res-label">Top Choice</div>
+            <div class="res-val" style="font-size: 16px;">${d.choice_winner}</div>
+            <div class="res-sub">${(d.choice_winner_prob * 100).toFixed(1)}% confidence</div>
+          </div>
+          <div class="res-card">
+            <div class="res-label">Rating</div>
+            <div class="res-val">${scoreVal} <span style="font-size: 13px; font-weight: normal; color: var(--muted);">/ ${d.scale_max}</span></div>
+            <div class="res-sub">Range: ${d.scale_min} to ${d.scale_max} (Norm: ${(d.normalized_score * 100).toFixed(0)}%)</div>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; font-size: 13px;">
+          <div style="font-weight: 600; margin-bottom: 4px; color: var(--muted); font-size: 11px; text-transform: uppercase;">All Choice Options:</div>
+          ${d.choice_all.map(c => `
+            <div style="display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed var(--border);">
+              <span>${c.option}</span>
+              <span style="font-weight: 600;">${(c.prob * 100).toFixed(1)}%</span>
+            </div>
+          `).join('')}
+        </div>
+
+        <div class="meta-bar">
+          <span>Latency: <b>${d.latency_ms.toFixed(0)} ms</b> (${d.cache_hit ? '⚡ KV Cache Hit' : 'Cold Prefill'})</span>
+          <span>Tokens: S=${d.tokens_s}, Q=${d.tokens_q}</span>
+        </div>
+      `;
+    }
+
+    // Load neutral sample on start
+    selectSample(2);
+  </script>
+</body>
+</html>

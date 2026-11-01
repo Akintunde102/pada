@@ -1,0 +1,152 @@
+{
+  "$defs": {
+    "ChoiceQuestion": {
+      "additionalProperties": false,
+      "description": "Multi-choice categorical question selecting among mutually exclusive options.",
+      "properties": {
+        "instructions": {
+          "description": "The instruction prompt for this question.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Instructions",
+          "type": "string"
+        },
+        "type": {
+          "const": "choice",
+          "default": "choice",
+          "title": "Type",
+          "type": "string"
+        },
+        "criteria": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Dictionary mapping user option keys to their descriptive criteria.",
+          "title": "Criteria",
+          "type": "object"
+        }
+      },
+      "required": [
+        "instructions",
+        "criteria"
+      ],
+      "title": "ChoiceQuestion",
+      "type": "object"
+    },
+    "NoulQuestion": {
+      "additionalProperties": false,
+      "description": "Binary decision question (TypeSafe's Yes/No type).",
+      "properties": {
+        "instructions": {
+          "description": "The instruction prompt for this question.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Instructions",
+          "type": "string"
+        },
+        "type": {
+          "const": "noul",
+          "default": "noul",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instructions"
+      ],
+      "title": "NoulQuestion",
+      "type": "object"
+    },
+    "ScoreQuestion": {
+      "additionalProperties": false,
+      "description": "Ordinal scoring question predicting probability distribution across discrete ordered levels.",
+      "properties": {
+        "instructions": {
+          "description": "The instruction prompt for this question.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Instructions",
+          "type": "string"
+        },
+        "type": {
+          "const": "score",
+          "default": "score",
+          "title": "Type",
+          "type": "string"
+        },
+        "levels": {
+          "default": 5,
+          "description": "Number of discrete rating levels (e.g. 5 for a 1-5 scale).",
+          "maximum": 100,
+          "minimum": 2,
+          "title": "Levels",
+          "type": "integer"
+        },
+        "criteria": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional mapping of integer levels to qualitative descriptions.",
+          "title": "Criteria"
+        }
+      },
+      "required": [
+        "instructions"
+      ],
+      "title": "ScoreQuestion",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Top-level Jev inference request.",
+  "properties": {
+    "state": {
+      "description": "Shared state / context processed once across all questions.",
+      "maxLength": 131072,
+      "minLength": 1,
+      "title": "State",
+      "type": "string"
+    },
+    "questions": {
+      "additionalProperties": {
+        "discriminator": {
+          "mapping": {
+            "choice": "#/$defs/ChoiceQuestion",
+            "noul": "#/$defs/NoulQuestion",
+            "score": "#/$defs/ScoreQuestion"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/NoulQuestion"
+          },
+          {
+            "$ref": "#/$defs/ChoiceQuestion"
+          },
+          {
+            "$ref": "#/$defs/ScoreQuestion"
+          }
+        ]
+      },
+      "description": "Mapping from user question key to question definition.",
+      "title": "Questions",
+      "type": "object"
+    }
+  },
+  "required": [
+    "state",
+    "questions"
+  ],
+  "title": "JevRequest",
+  "type": "object"
+}

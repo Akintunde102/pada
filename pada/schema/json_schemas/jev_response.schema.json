@@ -1,0 +1,121 @@
+{
+  "$defs": {
+    "ChoiceResult": {
+      "additionalProperties": false,
+      "description": "Result for a multi-choice question.",
+      "properties": {
+        "probabilities": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Probability distribution mapped back to original user option keys.",
+          "title": "Probabilities",
+          "type": "object"
+        }
+      },
+      "required": [
+        "probabilities"
+      ],
+      "title": "ChoiceResult",
+      "type": "object"
+    },
+    "NoulResult": {
+      "additionalProperties": false,
+      "description": "Result for a binary noul question.",
+      "properties": {
+        "p_true": {
+          "description": "Calibrated posterior probability P(True).",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "P True",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p_true"
+      ],
+      "title": "NoulResult",
+      "type": "object"
+    },
+    "ScoreResult": {
+      "additionalProperties": false,
+      "description": "Result for an ordinal scoring question.",
+      "properties": {
+        "distribution": {
+          "description": "Probability distribution over ordinal levels [0, ..., K-1].",
+          "items": {
+            "type": "number"
+          },
+          "title": "Distribution",
+          "type": "array"
+        },
+        "expected": {
+          "description": "Probability-weighted expectation E[S] = sum(k * P(S=k)).",
+          "title": "Expected",
+          "type": "number"
+        }
+      },
+      "required": [
+        "distribution",
+        "expected"
+      ],
+      "title": "ScoreResult",
+      "type": "object"
+    },
+    "Usage": {
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "description": "Total input tokens (state + question branches).",
+          "minimum": 0,
+          "title": "Input Tokens",
+          "type": "integer"
+        },
+        "output_tokens": {
+          "description": "Synthetic post-inference billed tokens formula.",
+          "minimum": 0,
+          "title": "Output Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ],
+      "title": "Usage",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Top-level Jev inference response.",
+  "properties": {
+    "results": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/NoulResult"
+          },
+          {
+            "$ref": "#/$defs/ChoiceResult"
+          },
+          {
+            "$ref": "#/$defs/ScoreResult"
+          }
+        ]
+      },
+      "description": "Mapping from user question key to calibrated decision result.",
+      "title": "Results",
+      "type": "object"
+    },
+    "usage": {
+      "$ref": "#/$defs/Usage",
+      "description": "Token accounting and synthetic billing metrics."
+    }
+  },
+  "required": [
+    "results",
+    "usage"
+  ],
+  "title": "JevResponse",
+  "type": "object"
+}
