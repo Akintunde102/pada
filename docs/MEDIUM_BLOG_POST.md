@@ -294,16 +294,29 @@ If a softmax is forced to pick between `["mortgage", "parliament", "spreadsheet"
 
 ## 7. Speed Benchmarks, Development Demo & Scenario Suite Results
 
-### Benchmark 1: Speed Comparison—Packed Tree Pass vs. Sequential Calls vs. JSON `.generate()`
-To test whether packing branches into a single shared-trunk Tree Attention pass actually saves wall-clock time, we ran `scripts/benchmark_speed_comparison.py` on `Qwen/Qwen2.5-0.5B` (CPU, float32) across $Q = 4, 8,$ and $12$ questions over the same shared story:
+### Benchmark 1: Speed Comparison—Packed Tree vs. Sequential Calls vs. JSON `.generate()` (GPU & CPU)
+To test how much wall-clock latency Tree Attention saves across both GPU and CPU, we ran `scripts/benchmark_speed_comparison.py` across $Q = 4, 8,$ and $12$ questions over the same shared story, measuring:
+* **1a. Packed Tree Prefill (`pack_guided_tree`):** Pass 1 shared-trunk forward pass.
+* **1b. Full `TreeEngine.predict()`:** End-to-end latency including Pass 1 + Fused Stage-2 Constrained (`score_all_constrained_fused`) + Fused Stage-2 Open Mode (`complete_all_open_fused`) + $P(\text{stop})$ & OOD scoring.
+* **2. $Q$ Separate Sequential Calls:** Standard approach calling the model $Q$ times (re-encoding the story each time).
+* **3. Autoregressive JSON `.generate()`:** Decoding `6` tokens per question (`{"key": "val"}`) token-by-token.
 
-| Question Count ($Q$) | 1. Packed Tree Pass (`pack_guided_tree`) | 2. $Q$ Separate Sequential Calls | 3. Autoregressive JSON `.generate()` | Tree Speedup |
-| :--- | :--- | :--- | :--- | :--- |
-| **$Q = 4$** | **2,350.0 ms** (`587.5 ms/q`) | 10,621.8 ms (`2,655.4 ms/q`) | 5,891.8 ms (`24 tokens`) | **4.52× vs. Seq** (`2.51× vs. JSON`) |
-| **$Q = 8$** | **3,373.2 ms** (`421.7 ms/q`) | 17,528.9 ms (`2,191.1 ms/q`) | 8,616.0 ms (`48 tokens`) | **5.20× vs. Seq** (`2.55× vs. JSON`) |
-| **$Q = 12$** | **2,916.3 ms** (`243.0 ms/q`) | 24,803.0 ms (`2,066.9 ms/q`) | 11,387.5 ms (`72 tokens`) | **8.51× vs. Seq** (`3.90× vs. JSON`) |
+#### A. Local Laptop GPU (`NVIDIA Quadro P1000`, 4 GB VRAM, `float16`)
+| Model & Question Count | 1a. Tree Prefill | 1b. Full `TreeEngine` | 2. $Q$ Sequential Calls | 3. JSON `.generate()` | Full Engine Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`0.5B` ($Q = 4$)** | **395.5 ms** (`99 ms/q`) | **1,362.3 ms** (`341 ms/q`) | 1,616.4 ms (`404 ms/q`) | 4,613.7 ms (`24 tok`) | **1.19× vs. Seq** (`3.39× vs. JSON`) |
+| **`0.5B` ($Q = 8$)** | **480.6 ms** (`60 ms/q`) | **1,762.1 ms** (`220 ms/q`) | 3,197.8 ms (`400 ms/q`) | 8,794.5 ms (`48 tok`) | **1.81× vs. Seq** (`4.99× vs. JSON`) |
+| **`0.5B` ($Q = 12$)** | **574.8 ms** (`48 ms/q`) | **1,862.0 ms** (`155 ms/q`) | 4,619.3 ms (`385 ms/q`) | 15,074.1 ms (`72 tok`) | **2.48× vs. Seq** (**8.10× vs. JSON**) |
+| **`1.5B` ($Q = 12$)** | **4,971.3 ms** (`414 ms/q`) | **5,464.3 ms** (`455 ms/q`) | 28,938.3 ms (`2,412 ms/q`) | 17,012.7 ms (`72 tok`) | **5.30× vs. Seq** (**3.11× vs. JSON**) |
 
-At $Q = 12$ questions, evaluating the packed tree in one pass is **8.51× faster** than running 12 separate prefill calls (which re-encode the shared story 12 times) and **3.90× faster** than autoregressive JSON generation.
+#### B. CPU (`float32`, `Qwen/Qwen2.5-0.5B`)
+| Question Count ($Q$) | 1a. Tree Prefill | 1b. Full `TreeEngine` | 2. $Q$ Sequential Calls | 3. JSON `.generate()` | Full Engine Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **$Q = 4$** | **3,024.2 ms** (`756 ms/q`) | **5,714.6 ms** (`1,429 ms/q`) | 14,006.2 ms (`3,502 ms/q`) | 5,244.7 ms (`24 tok`) | **2.45× vs. Seq** (`0.92× vs. JSON`) |
+| **$Q = 8$** | **2,986.9 ms** (`373 ms/q`) | **5,770.5 ms** (`721 ms/q`) | 19,988.3 ms (`2,499 ms/q`) | 9,956.5 ms (`48 tok`) | **3.46× vs. Seq** (`1.73× vs. JSON`) |
+| **$Q = 12$** | **3,620.4 ms** (`302 ms/q`) | **6,714.2 ms** (`560 ms/q`) | 26,225.8 ms (`2,185 ms/q`) | 14,354.6 ms (`72 tok`) | **3.91× vs. Seq** (**2.14× vs. JSON**) |
+
+On GPU at $Q = 12$, the packed Tree Prefill (`574.8 ms` on `0.5B`) is **8.04× faster** than 12 sequential prefill calls and **26.2× faster** than autoregressive JSON `.generate()`, while the full end-to-end `TreeEngine.predict()` (`1,862.0 ms`, including multi-token subword continuation and $P(\text{stop})$ boundary scoring across all 12 questions) is **8.10× faster** than JSON generation.
 
 ---
 

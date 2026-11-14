@@ -25,7 +25,7 @@ from .constrained import (
     score_all_constrained_fused,
     finalize_constrained_dict,
 )
-from .open_mode import complete_batch_branched
+from .open_mode import complete_batch_branched, complete_all_open_fused
 from .diagnostics import (
     tok_str,
     tok_flags,
@@ -73,8 +73,9 @@ class TreeEngine:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if dtype is None:
-            if device == "cuda":
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            if device.startswith("cuda") and torch.cuda.is_available():
+                major, _ = torch.cuda.get_device_capability()
+                dtype = torch.bfloat16 if (major >= 8 and torch.cuda.is_bf16_supported()) else torch.float16
             else:
                 dtype = torch.float32
 
@@ -156,6 +157,45 @@ class TreeEngine:
             tok_str_fn=lambda tid: tok_str(tid, self.tokenizer),
         )
 
+        # Mode A: Prepare top-k first tokens for all Open Mode questions and score in a fused Stage-2 pass
+        open_first_tids: Dict[str, List[int]] = {}
+        open_logp_cache: Dict[str, torch.Tensor] = {}
+        open_content_mass: Dict[str, float] = {}
+        open_traces: Optional[Dict[str, List[Dict[str, Any]]]] = (
+            {} if self.diag_mode != "off" else None
+        )
+        for q_key, meta in branch_meta.items():
+            q_spec = questions[q_key]
+            candidates = q_spec.get("candidates") if isinstance(q_spec, dict) else None
+            if not candidates:
+                branch_logits = outputs.logits[0, meta["readout_idx"], :]
+                full_logp = F.log_softmax(branch_logits.float(), dim=-1)
+                open_logp_cache[q_key] = full_logp
+                open_content_mass[q_key] = float(
+                    torch.exp(full_logp[self.masks.content_word_mask]).sum().item()
+                )
+                masked = branch_logits.float().masked_fill(
+                    ~self.masks.content_word_mask, float("-inf")
+                )
+                open_first_tids[q_key] = torch.topk(masked, k=open_beam).indices.tolist()
+                if open_traces is not None:
+                    open_traces[q_key] = []
+
+        fused_open = complete_all_open_fused(
+            open_first_tids=open_first_tids,
+            tree_kv=outputs.past_key_values,
+            trunk_len=trunk_len,
+            tree_seg=tree_seg,
+            branch_meta=branch_meta,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            masks=self.masks,
+            traces=open_traces,
+            device=self.device,
+            tok_str_fn=lambda tid: tok_str(tid, self.tokenizer),
+            tok_flags_fn=lambda tid: tok_flags(tid, self.masks),
+        )
+
         results: Dict[str, Any] = {}
         for q_key, meta in branch_meta.items():
             q_spec = questions[q_key]
@@ -198,31 +238,10 @@ class TreeEngine:
                         masks=self.masks,
                     )
             else:  # MODE A: OPEN
-                isolated_kv = slice_branch_kv(
-                    past_kv=outputs.past_key_values,
-                    trunk_len=trunk_len,
-                    branch_start=meta["branch_start"],
-                    branch_end=meta["branch_end"],
-                    device=self.device,
-                )
-                full_logp = F.log_softmax(branch_logits.float(), dim=-1)
-                content_mass = float(torch.exp(full_logp[self.masks.content_word_mask]).sum().item())
-                masked = branch_logits.float().masked_fill(~self.masks.content_word_mask, float("-inf"))
-                top_ids = torch.topk(masked, k=open_beam).indices.tolist()
-
-                trace: Optional[List[Dict[str, Any]]] = [] if self.diag_mode != "off" else None
-                path_records = complete_batch_branched(
-                    first_tids=top_ids,
-                    isolated_kv=isolated_kv,
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    masks=self.masks,
-                    trace=trace,
-                    device=self.device,
-                    tok_str_fn=lambda tid: tok_str(tid, self.tokenizer),
-                    tok_flags_fn=lambda tid: tok_flags(tid, self.masks),
-                )
-                del isolated_kv
+                full_logp = open_logp_cache[q_key]
+                content_mass = open_content_mass[q_key]
+                path_records = fused_open[q_key]
+                trace = open_traces[q_key] if open_traces is not None else None
 
                 # Merge surface forms sharing a stem; never let a bare bound prefix override a full word
                 concepts: Dict[str, Any] = {}
@@ -281,8 +300,6 @@ class TreeEngine:
                     )
 
         del outputs
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
 
         return {
             "results": results,
