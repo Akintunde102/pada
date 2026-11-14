@@ -13,8 +13,10 @@ import hashlib
 import math
 import os
 import re
+import sys
 import time
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,6 +27,26 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from peft import PeftModel
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+# Ensure project root is on sys.path so `pada.schema` imports cleanly
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from pada.schema import (
+    AnonymousQuestion,
+    ChoiceQuestion,
+    ChoiceResult,
+    HostModelAdapter,
+    JevRequest,
+    JevResponse,
+    NoulQuestion,
+    NoulResult,
+    ScoreQuestion,
+    ScoreResult,
+    Usage,
+    calculate_output_tokens,
+)
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B"
 SPECIAL_TOKENS = ["<|state|>", "<|q|>", "<|opt|>", "<|readout|>",
@@ -118,9 +140,11 @@ def load_all_models():
 # =====================================================================
 # 3. HELPER: DYNAMIC SCALE PARSER
 # =====================================================================
-def parse_scale(question_text: str):
-    """Detects custom ranges like 'from 0 to 1' or 'from 1 to 10'. Default is (1.0, 5.0)."""
-    match = re.search(r'from\s+([0-9.]+)\s+to\s+([0-9.]+)', question_text, re.IGNORECASE)
+def parse_scale(text: str):
+    """Detects custom ranges like 'from 0 to 1', '1 to 10', or '0-100'. Default is (1.0, 5.0)."""
+    if not text:
+        return 1.0, 5.0
+    match = re.search(r'(?:from\s+)?([0-9.]+)\s*(?:to|-)\s*([0-9.]+)', text, re.IGNORECASE)
     if match:
         try:
             min_v = float(match.group(1))
@@ -146,23 +170,71 @@ def get_state_memory(state_text: str):
     return copy.deepcopy(STATE_CACHE[key][0]), STATE_CACHE[key][1], hit, key
 
 
-def evaluate_jev(state: str, noul_question: str, choice_question: str, options: List[str], score_question: str):
+def serialize_branch(branch: AnonymousQuestion) -> str:
+    """Serializes an anonymous question branch into Jev special-token format (zero user keys)."""
+    if branch.question_type == "noul":
+        return f"<|q|> <|noul|> {branch.instructions} <|readout|>"
+    elif branch.question_type == "choice":
+        opts_str = " ".join(f"{opt.text} <|opt|>" for opt in branch.options)
+        return f"<|q|> <|choice|> {branch.instructions} {opts_str} <|readout|>"
+    elif branch.question_type == "score":
+        rubric = ""
+        if branch.score_criteria:
+            items = [f"{lvl}: {desc}" for lvl, desc in sorted(branch.score_criteria.items())]
+            rubric = " (" + "; ".join(items) + ")"
+        return f"<|q|> <|score|> {branch.instructions}{rubric} <|readout|>"
+    else:
+        raise ValueError(f"Unsupported question type: {branch.question_type}")
+
+
+def continuous_to_ordinal_distribution(norm_score: float, levels: int) -> Tuple[List[float], float]:
+    """Maps continuous score p in (0, 1) to a K-level ordinal distribution over [0, ..., K-1]
+    and computes E[S] = sum(k * P(S=k)).
+    """
+    p = min(max(float(norm_score), 1e-6), 1.0 - 1e-6)
+    n = levels - 1
+    dist: List[float] = []
+    for k in range(levels):
+        prob_k = math.comb(n, k) * (p ** k) * ((1.0 - p) ** (n - k))
+        dist.append(prob_k)
+    total = sum(dist)
+    dist = [x / total for x in dist]
+    expected = sum(k * prob_k for k, prob_k in enumerate(dist))
+    return dist, expected
+
+
+def evaluate_jev_request(request: JevRequest) -> Tuple[JevResponse, Dict[str, Any]]:
+    """Executes a full JevRequest through HostModelAdapter key stripping, Tree Attention,
+    and readout heads, returning the canonical JevResponse and telemetry metadata.
+    """
     t0 = time.time()
-    cache, S, hit, state_hash = get_state_memory(state)
 
-    q_parts = [
-        f"<|q|> <|noul|> {noul_question} <|readout|>",
-        f"<|q|> <|choice|> {choice_question} " + " ".join(f"{o} <|opt|>" for o in options) + " <|readout|>",
-        f"<|q|> <|score|> {score_question} <|readout|>",
-    ]
-    q_pieces = [tokenizer.encode(p, add_special_tokens=False) for p in q_parts]
+    # 1. Strip all user question keys and option keys on the host side
+    stripped_input, mapping = HostModelAdapter.strip_request(request)
 
-    q_ids, q_seg, q_pos = [], [], []
-    for k, piece in enumerate(q_pieces, start=1):
-        q_ids += piece
-        q_seg += [k] * len(piece)
-        q_pos += list(range(S, S + len(piece)))
+    # 2. Fetch or compute Stage 1 KV cache for the shared state
+    cache, S, hit, state_hash = get_state_memory(stripped_input.state)
 
+    # 3. Tokenize each anonymous branch and record per-branch token spans
+    readout_id = tokenizer.convert_tokens_to_ids("<|readout|>")
+    opt_id = tokenizer.convert_tokens_to_ids("<|opt|>")
+
+    q_ids: List[int] = []
+    q_seg: List[int] = []
+    q_pos: List[int] = []
+    branch_spans: Dict[int, Tuple[int, int]] = {}
+
+    for k, branch in enumerate(stripped_input.branches, start=1):
+        branch_text = serialize_branch(branch)
+        piece = tokenizer.encode(branch_text, add_special_tokens=False)
+        start_idx = len(q_ids)
+        q_ids.extend(piece)
+        end_idx = len(q_ids)
+        branch_spans[branch.index] = (start_idx, end_idx)
+        q_seg.extend([k] * len(piece))
+        q_pos.extend(range(S, S + len(piece)))
+
+    # 4. Build Tree Attention mask: [1, 1, Q, S + Q]
     Q = len(q_ids)
     can_see_state = torch.ones((Q, S), dtype=torch.bool)
     seg_t = torch.tensor(q_seg)
@@ -172,6 +244,7 @@ def evaluate_jev(state: str, noul_question: str, choice_question: str, options: 
     allowed = torch.cat([can_see_state, can_see_q], dim=1)
     mask = torch.zeros((1, 1, Q, S + Q)).masked_fill_(~allowed, float("-inf"))
 
+    # 5. Single forward pass across all question branches
     with torch.no_grad():
         h_q = jev_model(
             input_ids=torch.tensor([q_ids]),
@@ -180,47 +253,108 @@ def evaluate_jev(state: str, noul_question: str, choice_question: str, options: 
             past_key_values=cache,
         ).last_hidden_state[0]
 
-    readout_id = tokenizer.convert_tokens_to_ids("<|readout|>")
-    opt_id = tokenizer.convert_tokens_to_ids("<|opt|>")
-    readouts = [i for i, t in enumerate(q_ids) if t == readout_id]
-    opts = [i for i, t in enumerate(q_ids) if t == opt_id]
-
-    q_vec = h_q[readouts[1]]
-    o_vec = h_q[opts]
+    # 6. Evaluate each branch dynamically using its readout and option indices
+    raw_outputs: Dict[int, Any] = {}
+    branch_norm_scores: Dict[int, float] = {}
 
     with torch.no_grad():
-        # 1. Noul (Calibrated Yes/No)
-        p_noul = torch.sigmoid(heads["noul"](h_q[readouts[0]]) / calibrated_T["noul"]).item()
+        for branch in stripped_input.branches:
+            b_start, b_end = branch_spans[branch.index]
+            b_readouts = [i for i in range(b_start, b_end) if q_ids[i] == readout_id]
+            if not b_readouts:
+                raise RuntimeError(f"Missing <|readout|> token in branch {branch.index}")
+            r_idx = b_readouts[-1]
 
-        # 2. Choice (Calibrated Option Probabilities)
-        c_probs = F.softmax(heads["choice"](q_vec, o_vec) / calibrated_T["choice"], -1).tolist()
+            if branch.question_type == "noul":
+                p_noul = torch.sigmoid(heads["noul"](h_q[r_idx]) / calibrated_T["noul"]).item()
+                raw_outputs[branch.index] = p_noul
 
-        # 3. Universal Continuous Score (Normalized 0.0 to 1.0)
-        norm_score = torch.sigmoid(heads["score"](h_q[readouts[2]]) / calibrated_T["score"]).item()
+            elif branch.question_type == "choice":
+                b_opts = [i for i in range(b_start, b_end) if q_ids[i] == opt_id]
+                q_vec = h_q[r_idx]
+                o_vec = h_q[b_opts]
+                c_probs = F.softmax(heads["choice"](q_vec, o_vec) / calibrated_T["choice"], -1).tolist()
+                raw_outputs[branch.index] = c_probs
 
-    best_idx = int(torch.tensor(c_probs).argmax())
-    choice_all = [{"option": opt, "prob": prob} for opt, prob in zip(options, c_probs)]
+            elif branch.question_type == "score":
+                levels = branch.score_levels or 5
+                head_out = heads["score"](h_q[r_idx]) / calibrated_T["score"]
+                if head_out.numel() == 1:
+                    norm_score = torch.sigmoid(head_out).item()
+                    branch_norm_scores[branch.index] = norm_score
+                    dist, expected = continuous_to_ordinal_distribution(norm_score, levels)
+                else:
+                    probs_t = F.softmax(head_out, dim=-1)
+                    dist = probs_t.tolist()
+                    expected = sum(k * p for k, p in enumerate(dist))
+                    branch_norm_scores[branch.index] = expected / max(1, levels - 1)
+                raw_outputs[branch.index] = (dist, expected)
 
-    # Dynamic Range Scaling
-    min_val, max_val = parse_scale(score_question)
-    scaled_rating = min_val + norm_score * (max_val - min_val)
+    # 7. Calculate synthetic token billing and reconstruct user-keyed JevResponse
+    billed_output_tokens = calculate_output_tokens(request.questions, tokenizer=tokenizer)
+    usage = Usage(input_tokens=S + Q, output_tokens=billed_output_tokens)
+    jev_response = HostModelAdapter.reconstruct_response(mapping, raw_outputs, usage)
 
     latency_ms = (time.time() - t0) * 1000.0
-
-    return {
+    meta = {
         "latency_ms": latency_ms,
         "cache_hit": hit,
         "state_hash": state_hash,
         "tokens_s": S,
         "tokens_q": Q,
-        "noul_prob": p_noul,
+        "branch_norm_scores": branch_norm_scores,
+    }
+    return jev_response, meta
+
+
+def evaluate_jev(state: str, noul_question: str, choice_question: str, options: List[str], score_question: str, score_scale: Optional[str] = None):
+    """Studio UI helper that builds a canonical JevRequest and delegates to evaluate_jev_request."""
+    criteria_map = {f"opt_{i}": opt_text for i, opt_text in enumerate(options)}
+    jev_req = JevRequest(
+        state=state,
+        questions={
+            "noul_q": NoulQuestion(instructions=noul_question),
+            "choice_q": ChoiceQuestion(instructions=choice_question, criteria=criteria_map),
+            "score_q": ScoreQuestion(instructions=score_question, levels=5),
+        },
+    )
+
+    jev_res, meta = evaluate_jev_request(jev_req)
+
+    noul_res = jev_res.results["noul_q"]
+    choice_res = jev_res.results["choice_q"]
+    score_res = jev_res.results["score_q"]
+
+    assert isinstance(noul_res, NoulResult)
+    assert isinstance(choice_res, ChoiceResult)
+    assert isinstance(score_res, ScoreResult)
+
+    c_probs = [choice_res.probabilities[f"opt_{i}"] for i in range(len(options))]
+    best_idx = int(torch.tensor(c_probs).argmax())
+    choice_all = [{"option": opt, "prob": prob} for opt, prob in zip(options, c_probs)]
+
+    norm_score = meta["branch_norm_scores"].get(2, score_res.expected / 4.0)
+    scale_text = score_scale if score_scale else score_question
+    min_val, max_val = parse_scale(scale_text)
+    scaled_rating = min_val + norm_score * (max_val - min_val)
+
+    return {
+        "latency_ms": meta["latency_ms"],
+        "cache_hit": meta["cache_hit"],
+        "state_hash": meta["state_hash"],
+        "tokens_s": meta["tokens_s"],
+        "tokens_q": meta["tokens_q"],
+        "noul_prob": noul_res.p_true,
         "choice_winner": options[best_idx],
         "choice_winner_prob": c_probs[best_idx],
         "choice_all": choice_all,
         "normalized_score": norm_score,
         "expected_rating": scaled_rating,
+        "score_distribution": score_res.distribution,
+        "score_expected_0_indexed": score_res.expected,
         "scale_min": min_val,
         "scale_max": max_val,
+        "jev_response": jev_res.model_dump(),
     }
 
 
@@ -236,6 +370,7 @@ class EvaluateRequest(BaseModel):
     choice_question: str
     options: List[str]
     score_question: str
+    score_scale: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
@@ -253,6 +388,13 @@ def get_studio_ui():
         return f.read()
 
 
+@app.post("/v1/evaluate", response_model=JevResponse)
+def api_v1_evaluate(req: JevRequest) -> JevResponse:
+    """Canonical Jev / Pada evaluation endpoint complying strictly with pada.schema."""
+    jev_res, _ = evaluate_jev_request(req)
+    return jev_res
+
+
 @app.post("/api/evaluate")
 def api_evaluate(req: EvaluateRequest):
     return evaluate_jev(
@@ -261,6 +403,7 @@ def api_evaluate(req: EvaluateRequest):
         choice_question=req.choice_question,
         options=req.options,
         score_question=req.score_question,
+        score_scale=req.score_scale,
     )
 
 
