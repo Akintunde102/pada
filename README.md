@@ -56,7 +56,8 @@ scripts/
 ├── demo_readout_heads.py          # Multi-head extraction from packed sequence
 ├── demo_multi_scenarios.py        # Multi-domain readout evaluation demo
 ├── demo_kv_cache_serving.py       # KV cache reuse across sequential evaluations
-└── train_stage_a.py               # Proper scoring rule (BCE + Brier) training script
+├── train_stage_a.py               # Stage A proper scoring rule (BCE + Brier) warmup script
+└── train_colab_1_5b.py            # Full Stage A + Stage B LoRA (q_proj, v_proj) + heads training script
 docs/
 ├── MEDIUM_BLOG_POST.md            # Complete technical walkthrough & article
 └── JEV_IMPLEMENTATION_GUIDE.md    # Track 1 architecture & training reference

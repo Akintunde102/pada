@@ -108,10 +108,20 @@ def load_all_models():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
 
-    print("[*] Loading Qwen2.5-1.5B with Trained LoRA Adapter...", flush=True)
+    print("[*] Loading Qwen2.5-1.5B Backbone...", flush=True)
     base_model = AutoModel.from_pretrained(MODEL_NAME, dtype=torch.float32)
     base_model.resize_token_embeddings(len(tokenizer))
-    jev_model = PeftModel.from_pretrained(base_model, "checkpoints/jev_1_5b_lora_adapter")
+    adapter_path = "checkpoints/jev_1_5b_lora_adapter"
+    if os.path.exists(adapter_path):
+        print(f"[+] Attaching trained LoRA adapter from {adapter_path}...", flush=True)
+        jev_model = PeftModel.from_pretrained(base_model, adapter_path)
+    else:
+        print(
+            f"[!] {adapter_path} not found locally; running with base Qwen2.5-1.5B weights "
+            "(run scripts/train_colab_1_5b.py to train LoRA + heads).",
+            flush=True,
+        )
+        jev_model = base_model
     jev_model.eval()
 
     d = jev_model.config.hidden_size
