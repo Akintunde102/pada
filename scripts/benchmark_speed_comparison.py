@@ -13,9 +13,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pada.tree_engine.tree_builder import pack_guided_tree
 from pada.tree_engine.lexicon import build_vocab_masks
+from pada.tree_engine.constrained import score_all_constrained_fused
+from pada.tree_engine.open_mode import complete_all_open_fused
 from pada.tree_engine.engine import TreeEngine
 from scripts.test_story_comprehension import STORY, QUESTIONS
 
@@ -50,7 +53,76 @@ def run_benchmark(
     # Warmup pass (especially important for CUDA kernel initialization)
     q_items = list(QUESTIONS.items())
     _ = engine.predict(state=STORY, questions=dict(q_items[:2]))
+    _sync(device, clear_cache=True)
+
+    # Stage-by-Stage Internal Profiler on all 12 questions (5 Open + 3 Constrained + 4 NOUL)
+    t_s0 = time.perf_counter()
+    ids_t, mask_4d, pos_t, branch_meta, trunk_len, tree_seg = pack_guided_tree(
+        state=STORY,
+        questions=QUESTIONS,
+        tokenizer=tokenizer,
+        id_to_word=masks.id_to_word,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.inference_mode():
+        outputs = model(input_ids=ids_t, attention_mask=mask_4d, position_ids=pos_t, use_cache=True)
     _sync(device)
+    t_s1 = time.perf_counter()
+
+    constrained_specs = {
+        k: v["candidates"] for k, v in QUESTIONS.items() if isinstance(v, dict) and v.get("candidates")
+    }
+    _ = score_all_constrained_fused(
+        constrained_specs=constrained_specs,
+        tree_logits=outputs.logits,
+        tree_kv=outputs.past_key_values,
+        trunk_len=trunk_len,
+        tree_seg=tree_seg,
+        branch_meta=branch_meta,
+        model=model,
+        tokenizer=tokenizer,
+        stop_boundary_mask=masks.stop_boundary_mask,
+        device=device,
+    )
+    _sync(device)
+    t_s2 = time.perf_counter()
+
+    open_first_tids = {}
+    for q_key, meta in branch_meta.items():
+        if not QUESTIONS[q_key].get("candidates"):
+            branch_logits = outputs.logits[0, meta["readout_idx"], :].float()
+            masked = branch_logits.masked_fill(~masks.content_word_mask, float("-inf"))
+            open_first_tids[q_key] = torch.topk(masked, k=10).indices.tolist()
+
+    _ = complete_all_open_fused(
+        open_first_tids=open_first_tids,
+        tree_kv=outputs.past_key_values,
+        trunk_len=trunk_len,
+        tree_seg=tree_seg,
+        branch_meta=branch_meta,
+        model=model,
+        tokenizer=tokenizer,
+        masks=masks,
+        device=device,
+    )
+    _sync(device)
+    t_s3 = time.perf_counter()
+    del outputs, ids_t, mask_4d, pos_t, tree_seg
+
+    p1_ms = (t_s1 - t_s0) * 1000.0
+    p2_const_ms = (t_s2 - t_s1) * 1000.0
+    p2_open_ms = (t_s3 - t_s2) * 1000.0
+    p_tot_ms = p1_ms + p2_const_ms + p2_open_ms
+
+    print("\n" + "=" * 95)
+    print(f"STAGE-BY-STAGE PROFILER (Q = 12: 5 Open + 3 Constrained Choice + 4 Binary NOUL on {gpu_label})")
+    print("-" * 95)
+    print(f"  Pass 1  | Shared-Trunk Tree Prefill + KV Cache (all 12 Qs) : {p1_ms:>8.1f} ms ({p1_ms/p_tot_ms*100:>5.1f}%)")
+    print(f"  Pass 2a | Fused Constrained + P(stop) Scoring (7 Qs)       : {p2_const_ms:>8.1f} ms ({p2_const_ms/p_tot_ms*100:>5.1f}%)")
+    print(f"  Pass 2b | Fused Open-Mode Subword Completion (5 Qs)        : {p2_open_ms:>8.1f} ms ({p2_open_ms/p_tot_ms*100:>5.1f}%)")
+    print(f"  Total   | End-to-End TreeEngine Pipeline (all 12 Qs)       : {p_tot_ms:>8.1f} ms (100.0%)")
+    print("=" * 95)
 
     print("\n" + "=" * 118)
     print(

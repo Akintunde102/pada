@@ -100,9 +100,14 @@ python -m unittest discover -s tests -p "test_tree_*.py"
 
 ### 3. Run Track 2: Training-Free Tree Engine Demos, Speed Benchmarks & Suites
 
-* **Wall-Clock Speed Benchmark (Packed Tree vs. $Q$ Sequential Calls vs. JSON `.generate()`):**
+* **Wall-Clock Speed & Stage-by-Stage Profiler Benchmark (GPU or CPU):**
   ```bash
+  # Auto-detects CUDA GPU (float16) or falls back to CPU (float32):
   python scripts/benchmark_speed_comparison.py --model-name Qwen/Qwen2.5-0.5B
+
+  # Or explicitly target GPU or CPU:
+  python scripts/benchmark_speed_comparison.py --model-name Qwen/Qwen2.5-0.5B --device cuda --dtype float16
+  python scripts/benchmark_speed_comparison.py --model-name Qwen/Qwen2.5-0.5B --device cpu --dtype float32
   ```
 * **12-Question Story Comprehension Walkthrough (Open + Constrained + NOUL in 1 Pass):**
   ```bash
@@ -113,8 +118,8 @@ python -m unittest discover -s tests -p "test_tree_*.py"
   # Full run including float32 tree-vs-sequential equivalence verification (< 1e-3):
   python scripts/run_tree_engine.py --model-name Qwen/Qwen2.5-0.5B
 
-  # Or skip verification to run the 11 scenarios directly:
-  python scripts/run_tree_engine.py --model-name Qwen/Qwen2.5-0.5B --skip-verify
+  # Or run on 1.5B (skipping verification to jump straight to the 11 scenarios):
+  python scripts/run_tree_engine.py --model-name Qwen/Qwen2.5-1.5B --skip-verify
   ```
 
 ### 4. Run Track 1: Jev-Style FastAPI Server & Architectural Demos
@@ -128,6 +133,46 @@ python -m unittest discover -s tests -p "test_tree_*.py"
   python scripts/demo_tree_attention.py
   python scripts/demo_kv_cache_serving.py
   ```
+
+---
+
+## 📊 Profiling, Speed Benchmarks & Multi-Domain Results
+
+### 1. Stage-by-Stage GPU Profiler ($Q = 12$: 5 Open + 3 Constrained + 4 NOUL on `NVIDIA Quadro P1000`, `Qwen2.5-0.5B`)
+Both Constrained Mode (`score_all_constrained_fused`) and Open Mode (`complete_all_open_fused`) execute directly on top of Pass 1's `tree_kv` (`batch_size = 1`, zero KV cache duplication):
+
+| Pipeline Stage (`TreeEngine.predict()`) | What Happens Inside This Stage | GPU Time (`ms`) | Share of Total |
+| :--- | :--- | :--- | :--- |
+| **Pass 1 (`pack_guided_tree`)** | Encodes shared story + all 12 question branches in 1 4D Tree Attention pass; extracts single-token logits & `tree_kv` | **576.9 ms** (`48 ms/q`) | **31.0%** |
+| **Pass 2a (`score_all_constrained_fused`)** | Scores all candidate tokens + $P(\text{stop})$ across all 7 Constrained & NOUL questions in 1 fused pass on `tree_kv` | **282.7 ms** (`40 ms/q`) | **15.2%** |
+| **Pass 2b (`complete_all_open_fused`)** | Completes multi-token BPE subwords (`'Ġc' + 'ello'`) + $P(\text{stop})$ across all 5 Open Mode questions on `tree_kv` | **1,002.4 ms** (`200 ms/q`) | **53.8%** |
+| **Full `TreeEngine.predict()` Total** | **All 12 questions (5 Open + 3 Choice + 4 NOUL) + 2D OOD scoring** | **1,862.0 ms** (`155 ms/q`) | **100.0%** |
+
+### 2. End-to-End Speed Comparison: Packed Tree vs. Sequential Calls vs. JSON `.generate()`
+* **1a. Tree Prefill (`pack_guided_tree`):** Pass 1 shared-trunk forward pass.
+* **1b. Full `TreeEngine`:** Complete end-to-end pipeline (Pass 1 + Fused Constrained + Fused Open Mode + $P(\text{stop})$ + OOD).
+* **2. $Q$ Sequential Calls:** Standard approach calling `model(story + question_i)` $Q$ separate times.
+* **3. JSON `.generate()`:** Autoregressive generation decoding `6` tokens per question (`{"key": "val"}`).
+
+| Hardware & Model ($Q$ Questions) | 1a. Tree Prefill | 1b. Full `TreeEngine` | 2. $Q$ Sequential Calls | 3. JSON `.generate()` | Full Engine Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 4$)** | **395.5 ms** (`99 ms/q`) | **1,362.3 ms** (`341 ms/q`) | 1,616.4 ms (`404 ms/q`) | 4,613.7 ms (`24 tok`) | **1.19× vs. Seq** (`3.39× vs. JSON`) |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 8$)** | **480.6 ms** (`60 ms/q`) | **1,762.1 ms** (`220 ms/q`) | 3,197.8 ms (`400 ms/q`) | 8,794.5 ms (`48 tok`) | **1.81× vs. Seq** (`4.99× vs. JSON`) |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 12$)** | **574.8 ms** (`48 ms/q`) | **1,862.0 ms** (`155 ms/q`) | 4,619.3 ms (`385 ms/q`) | 15,074.1 ms (`72 tok`) | **2.48× vs. Seq** (**8.10× vs. JSON**) |
+| **GPU `Quadro P1000` — `1.5B` ($Q = 12$)** | **4,971.3 ms** (`414 ms/q`) | **5,464.3 ms** (`455 ms/q`) | 28,938.3 ms (`2,412 ms/q`) | 17,012.7 ms (`72 tok`) | **5.30× vs. Seq** (**3.11× vs. JSON**) |
+| **CPU `float32` — `0.5B` ($Q = 12$)** | **3,620.4 ms** (`302 ms/q`) | **6,714.2 ms** (`560 ms/q`) | 26,225.8 ms (`2,185 ms/q`) | 14,354.6 ms (`72 tok`) | **3.91× vs. Seq** (**2.14× vs. JSON**) |
+
+### 3. Multi-Domain Evaluation Results (`Qwen2.5-0.5B` vs. `Qwen2.5-1.5B`)
+| Suite / Category (`35` Scored + `2` OOD Controls = `37` Total) | `Qwen2.5-0.5B` | `Qwen2.5-1.5B` | Notes |
+| :--- | :--- | :--- | :--- |
+| **12-Question Story Demo (`test_story_comprehension.py`)** | **50.0%** (`6 / 12`) | **100.0%** (`11 / 12` confident + `1` borderline `52.1%`) | 5 Open + 3 Constrained + 4 NOUL (`3.90s` on GPU) |
+| **Secondary Domain Suite (`12` questions)** | **83.3%** (`10 / 12`) | **83.3%** (`10 / 12`) | Hospitality, Port Logistics, University, Agriculture |
+| **Primary Dev Suite (`23` scored questions)** | **65.2%** (`15 / 23`) | **69.6%** (`16 / 23`) | Adversarial prefix-collision & multi-token edge cases |
+| **Constrained Mode (`24` questions)** | **66.7%** (`16 / 24`) | **75.0%** (`18 / 24`) | 17 of 24 require inferential reasoning beyond surface text |
+| **Open Mode (`11` questions)** | **81.8%** (`9 / 11`) | **72.7%** (`8 / 11`) | Zero candidate list provided |
+| **Extractive Subset (`13` of 35 questions)** | **84.6%** (`11 / 13`) | **69.2%** (`9 / 13`) | Answer word appears verbatim in the situation text |
+| **Inferential Subset (`22` of 35 questions)** | **63.6%** (`14 / 22`) | **77.3%** (`17 / 22`) | Answer requires reasoning (`1.5B` jumps +13.7% here) |
+| **OOD Assertions (`3` checks in Scenario 7)** | **2 / 3 Passed** | **3 / 3 Passed** | `1.5B` passes all 3 gross & hard-negative OOD checks |
 
 ---
 
