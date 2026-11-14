@@ -48,6 +48,7 @@ pada/
 │   ├── suites.py                  # 11-scenario multi-domain evaluation suites
 │   └── verification.py            # Mathematical tree-vs-sequential equivalence proofs
 scripts/
+├── benchmark_speed_comparison.py  # Wall-clock latency benchmark (Tree vs. Sequential vs. JSON)
 ├── test_story_comprehension.py    # 12-question reading comprehension demo (Open + Choice + NOUL)
 ├── run_tree_engine.py             # CLI runner for Track 2 equivalence proofs & 11-scenario suite
 ├── server.py                      # Track 1 FastAPI server + Two-Stage SHA-256 KV cache
@@ -97,8 +98,12 @@ python tests/test_schema.py
 python -m unittest discover -s tests -p "test_tree_*.py"
 ```
 
-### 3. Run Track 2: Training-Free Tree Engine Demos & Suites
+### 3. Run Track 2: Training-Free Tree Engine Demos, Speed Benchmarks & Suites
 
+* **Wall-Clock Speed Benchmark (Packed Tree vs. $Q$ Sequential Calls vs. JSON `.generate()`):**
+  ```bash
+  python scripts/benchmark_speed_comparison.py --model-name Qwen/Qwen2.5-0.5B
+  ```
 * **12-Question Story Comprehension Walkthrough (Open + Constrained + NOUL in 1 Pass):**
   ```bash
   python scripts/test_story_comprehension.py --model-name Qwen/Qwen2.5-1.5B
