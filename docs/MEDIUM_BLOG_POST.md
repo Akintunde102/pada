@@ -22,7 +22,7 @@ Together, TypeSafe's design and `archerhume`'s probe highlighted two common pain
 Standard LLM workflows often ask a model to generate structured JSON (`{"department": "payments", "urgent": true}`) one token (word piece) at a time in a sequential loop. Even with a KV cache, every generated token requires streaming billions of model weights from GPU memory into the compute cores.
 
 * **What about `max_tokens=1` + `logprobs` + Prefix Caching?** Experienced ML engineers know you don't *have* to generate full JSON to get label probabilities—you can set `max_tokens=1` with `logprobs=True` and rely on prefix caching (via vLLM or SGLang) to share the document state across requests.
-* **Where single-token probing still falls short:** First, evaluating $Q$ questions still requires dispatching $Q$ separate requests or sequences rather than packing isolated branches into one shared-trunk forward pass. Second, when candidate words split into multiple BPE tokens (like `' cardiology'` $\rightarrow$ `[' cardi', 'ology']`), `max_tokens=1` cannot score the full word or verify that the word actually terminates ($P(\text{stop} \mid \text{candidate})$). Third, for open-ended questions without a fixed candidate list, `max_tokens=1` gets trapped by sentence starters (`' that'`, `' the'`) or truncated BPE stems (`'Ġloc'`, `'Ġc'`).
+* **Where single-token probing still falls short:** First, evaluating $Q$ questions still requires dispatching $Q$ separate requests or sequences rather than packing isolated branches into one shared-trunk forward pass. Second, when candidate words split into multiple BPE tokens (like `' cardiology'` $\rightarrow$ `['Ġcard', 'iology']`), `max_tokens=1` cannot score the full word or verify that the word actually terminates ($P(\text{stop} \mid \text{candidate})$). Third, for open-ended questions without a fixed candidate list, `max_tokens=1` gets trapped by sentence starters (`' that'`, `' the'`) or truncated BPE stems (`'Ġloc'`, `'Ġc'`).
 
 ### Pain Point #2: Verbalized Confidence Is Not Guaranteed to Be Calibrated
 When applications ask a chat model to output a text string like `"90% confident"`, that string is generated token-by-token—it is not automatically guaranteed to reflect a calibrated 90% empirical accuracy. While some research finds that verbalized confidence can be reasonably calibrated on certain RLHF models, TypeSafe introduced **RLCD** as a training method to directly optimize output probability distributions rather than human chat preferences, exposing those probabilities across three output primitives: `choice` (categorical options), `score` (ordered rubrics), and `noul` (binary yes/no decisions). *(Independent evaluations of Jev's calibration vary by domain: `archerhume` reported an Expected Calibration Error [ECE] of `0.0313` on MMLU, while an [independent synthetic support-ticket benchmark](https://www.dsebastien.net/reinforcement-learning-for-calibrated-decisions-rlcd/) reported an ECE of `0.107`).*
@@ -33,7 +33,7 @@ Because Jev is closed-weight and proprietary, we are not claiming to replicate T
 * **Existing Open-Source Jev Clones:** Community projects such as **[Kev](https://themenonlab.blog/blog/kev-open-source-decision-model)** (`jaredpalmer/kev`, which pairs a Qwen base model + LoRA adapter + pointer head + shared-state attention masking), **SemIf** (`TheoLeeCJ/SemIf-OpenJev`, formerly `openjev`), **[sarvam-jev](https://github.com/SAGAR-TAMANG/sarvam-jev/wiki)** (`SAGAR-TAMANG/sarvam-jev`), **`kyegomez/open-jev`**, **Laya**, **Nimble** (which reads candidate-token logits), and **jevos** have explored shared-state prefill and readout architectures.
 * **What We Built in Our Repository (`pada` on `Qwen2.5-0.5B` & `1.5B`):**
   1. **Track 1 (Custom Readout Heads — `pada/schema/` + `scripts/server.py`):** Similar in spirit to `Kev`, we built a prefill-only engine with 7 custom special tokens (`<|state|>`, `<|q|>`, `<|opt|>`, `<|readout|>`, `<|noul|>`, `<|choice|>`, `<|score|>`), a host-side key-stripping adapter (`HostModelAdapter`), and three custom readout heads (`NoulHead`, a scaled dot-product `ChoiceHead` pointer scorer, and a continuous `UniversalScoreHead`), trained via `scripts/train_colab_1_5b.py`.
-  2. **Track 2 (Training-Free `lm_head` Tree Engine — `pada/tree_engine/`):** When our custom heads hit an out-of-domain wall, we built a second engine inside `pada/tree_engine/` that bypasses custom heads and probes the model's native **`lm_head`** directly—combining a shared-trunk 4D Tree Attention pass with a fused KV-cached continuation pass to evaluate open-vocabulary single-word extraction, multiple-choice, and boolean questions without any fine-tuning.
+  2. **Track 2 (Training-Free `lm_head` Tree Engine & `Nameless` Open Mode — `pada/tree_engine/`):** When our custom heads hit an out-of-domain wall, we built a second engine inside `pada/tree_engine/` that bypasses custom heads and probes the model's native **`lm_head`** directly—combining a shared-trunk 4D Tree Attention pass with a fused KV-cached continuation pass to evaluate closed-world multiple-choice and boolean questions, plus an extended **Open Mode (`Nameless`)** for open-vocabulary single-word extraction without any fine-tuning.
 
 ---
 
@@ -215,7 +215,7 @@ That led us to ask: **Can we evaluate both constrained choices AND open-ended qu
 > **⚡ ML Fast-Track:** Every causal LLM already has a pretrained readout matrix: `lm_head.weight` $\in \mathbb{R}^{V \times d}$ ($V = 151,936$ in Qwen2.5). Both `Qwen2.5-0.5B` and `Qwen2.5-1.5B` set `tie_word_embeddings = True`, meaning `lm_head.weight` is tied directly to `embed_tokens.weight`.
 > To run closed-world Jev decisions (`choice` and binary `noul` `yes`/`no`) without training custom heads, `pada/tree_engine/` executes:
 > * **Pass 1 (Shared-Trunk Tree Pass — `pack_guided_tree`):** Packs `GUIDED_ANCHOR_PROMPT` + `Situation: <state>` (Segment $0$, length $S$) and all $M$ isolated question branches (`Question: <instr> One-word answer:`, Segments $1 \dots M$, positions restarted at $S$) into one forward pass with `use_cache=True`. For single-token binary `noul` (`' yes'` = `9834`, `' no'` = `902`) or single-token choices, `outputs.logits[0, readout_idx, :]` immediately yields $\log P(t_1 \mid \text{state}, q_k)$.
-> * **Pass 2 (Fused Stage-2 Candidate & Boundary Pass — `score_all_constrained_fused`):** To score multi-token candidates (`' cardiology'` $\rightarrow$ `['Ġcardi', 'ology']`) and read $P(\text{stop} \mid \text{candidate})$ after each candidate's final token, we pack all candidate token sequences across all constrained questions directly on top of Pass 1's `tree_kv` (`batch_size = 1`) using a 4D continuation mask (`[1, 1, T, P + T]`), run **one fused teacher-forced pass**, and crop `tree_kv` back to $P$.
+> * **Pass 2 (Fused Stage-2 Candidate & Boundary Pass — `score_all_constrained_fused`):** To score multi-token candidates (`' cardiology'` $\rightarrow$ `['Ġcard', 'iology']`) and read $P(\text{stop} \mid \text{candidate})$ after each candidate's final token, we pack all candidate token sequences across all constrained questions directly on top of Pass 1's `tree_kv` (`batch_size = 1`) using a 4D continuation mask (`[1, 1, T, P + T]`), run **one fused teacher-forced pass**, and crop `tree_kv` back to $P$.
 
 ### 🌱 The Beginner Picture: Using the Dictionary the Model Already Knows
 Before we go beyond Jev, let's finish solving Jev's closed-world tasks (`choice` and `noul`) in a way that works across **any** domain without training custom heads.
@@ -251,7 +251,7 @@ Because `Qwen2.5-0.5B` and `1.5B` tie their input and output embeddings (`tie_wo
    * Second, we check how "surprised" the model is by the question itself (**Question Premise Log-Likelihood**). If you averaged across all words in *"What did the astronaut repair on the lunar spaceship?"*, 6 of the 9 words (`What`, `did`, `the`, `on`...) are everyday question words that appear in every English question and would hide the surprise! So we cross out **`QUESTION_STOPWORDS`** (`GRAMMAR_GLUE` + `"what"`, `"which"`, `"did"`, `"does"`...) and only measure surprise on the **meaningful topic words** (`"astronaut"`, `"repair"`, `"lunar"`, `"spaceship"`), immediately flagging `is_ood = True`.
 
 > **✅ Milestone Reached — The Closed-World Jev System Is Complete:**
-> At this point, we have a complete, domain-general implementation of the Jev paradigm: shared context trunk, isolated Tree Attention branches, calibrated `choice` over any candidate list, and `noul` (`yes`/`no`) boolean decisions.
+> At this point, we have a complete, domain-general implementation of the Jev paradigm: shared context trunk, isolated Tree Attention branches, $P(\text{stop})$-normalized `choice` over any candidate list, and `noul` (`yes`/`no`) boolean decisions.
 
 ---
 
@@ -348,10 +348,10 @@ When we first moved our engine from CPU onto a local laptop GPU (**NVIDIA Quadro
 #### Stage-by-Stage Internal GPU Profile ($Q = 12$ Mixed Questions on `Quadro P1000`, `Qwen2.5-0.5B`)
 | Pipeline Stage (`TreeEngine.predict()`) | What Happens Inside This Stage | GPU Time (`ms`) | Share of Total |
 | :--- | :--- | :--- | :--- |
-| **Pass 1 (`pack_guided_tree`)** | Encodes shared story + all 12 question branches in 1 4D Tree Attention pass; extracts single-token logits & `tree_kv` | **576.9 ms** (`48 ms/q`) | **31.0%** |
-| **Pass 2a (`score_all_constrained_fused`)** | Scores all candidate tokens + $P(\text{stop})$ across all 7 Constrained & NOUL questions in 1 fused pass on `tree_kv` | **282.7 ms** (`40 ms/q`) | **15.2%** |
-| **Pass 2b (`complete_all_open_fused`)** | Completes multi-token BPE subwords (`'Ġc' + 'ello'`) + $P(\text{stop})$ across all 5 Open Mode questions on `tree_kv` | **1,002.4 ms** (`200 ms/q`) | **53.8%** |
-| **Full `TreeEngine.predict()` Total** | **All 12 questions (5 Open + 3 Choice + 4 NOUL) + 2D OOD scoring** | **1,862.0 ms** (`155 ms/q`) | **100.0%** |
+| **Pass 1 (`pack_guided_tree`)** | Encodes shared story + all 12 question branches in 1 4D Tree Attention pass; extracts single-token logits & `tree_kv` | **589.6 ms** (`49 ms/q`) | **29.4%** |
+| **Pass 2a (`score_all_constrained_fused`)** | Scores all candidate tokens + $P(\text{stop})$ across all 7 Constrained & NOUL questions in 1 fused pass on `tree_kv` | **354.3 ms** (`51 ms/q`) | **17.7%** |
+| **Pass 2b (`complete_all_open_fused`)** | Completes multi-token BPE subwords (`'Ġc' + 'ello'`) + $P(\text{stop})$ across all 5 Open Mode questions on `tree_kv` | **1,062.3 ms** (`212 ms/q`) | **52.9%** |
+| **Full `TreeEngine.predict()` Total** | **All 12 questions (5 Open + 3 Choice + 4 NOUL) + 2D OOD scoring** | **2,006.2 ms** (`167 ms/q`) | **100.0%** |
 
 ---
 
@@ -365,9 +365,9 @@ To make the comparison crystal clear for readers, `scripts/benchmark_speed_compa
 ##### A. Local Laptop GPU (`NVIDIA Quadro P1000`, 4 GB VRAM, `float16`)
 | Model & Question Count | 1a. Tree Prefill | 1b. Full `TreeEngine` | 2. $Q$ Sequential Calls | 3. JSON `.generate()` | Full Engine Speedup |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`0.5B` ($Q = 4$)** | **395.5 ms** (`99 ms/q`) | **1,362.3 ms** (`341 ms/q`) | 1,616.4 ms (`404 ms/q`) | 4,613.7 ms (`24 tok`) | **1.19× vs. Seq** (`3.39× vs. JSON`) |
-| **`0.5B` ($Q = 8$)** | **480.6 ms** (`60 ms/q`) | **1,762.1 ms** (`220 ms/q`) | 3,197.8 ms (`400 ms/q`) | 8,794.5 ms (`48 tok`) | **1.81× vs. Seq** (`4.99× vs. JSON`) |
-| **`0.5B` ($Q = 12$)** | **574.8 ms** (`48 ms/q`) | **1,862.0 ms** (`155 ms/q`) | 4,619.3 ms (`385 ms/q`) | 15,074.1 ms (`72 tok`) | **2.48× vs. Seq** (**8.10× vs. JSON**) |
+| **`0.5B` ($Q = 4$)** | **414.2 ms** (`104 ms/q`) | **1,730.9 ms** (`433 ms/q`) | 1,860.3 ms (`465 ms/q`) | 4,522.8 ms (`24 tok`) | **1.07× vs. Seq** (`2.61× vs. JSON`) |
+| **`0.5B` ($Q = 8$)** | **481.4 ms** (`60 ms/q`) | **1,842.0 ms** (`230 ms/q`) | 3,526.1 ms (`441 ms/q`) | 8,726.1 ms (`48 tok`) | **1.91× vs. Seq** (`4.74× vs. JSON`) |
+| **`0.5B` ($Q = 12$)** | **581.2 ms** (`48 ms/q`) | **1,892.7 ms** (`158 ms/q`) | 4,726.7 ms (`394 ms/q`) | 12,459.7 ms (`72 tok`) | **2.50× vs. Seq** (**6.58× vs. JSON**) |
 | **`1.5B` ($Q = 12$)** | **4,971.3 ms** (`414 ms/q`) | **5,464.3 ms** (`455 ms/q`) | 28,938.3 ms (`2,412 ms/q`) | 17,012.7 ms (`72 tok`) | **5.30× vs. Seq** (**3.11× vs. JSON**) |
 
 ##### B. CPU (`float32`, `Qwen/Qwen2.5-0.5B`)
@@ -378,9 +378,9 @@ To make the comparison crystal clear for readers, `scripts/benchmark_speed_compa
 | **$Q = 12$** | **3,620.4 ms** (`302 ms/q`) | **6,714.2 ms** (`560 ms/q`) | 26,225.8 ms (`2,185 ms/q`) | 14,354.6 ms (`72 tok`) | **3.91× vs. Seq** (**2.14× vs. JSON**) |
 
 * **Key Takeaways from the Numbers:**
-  1. **GPU vs. CPU:** On the 12-question story test with `Qwen2.5-1.5B`, moving from CPU (`39,652 ms`) to the local `Quadro P1000` GPU (`3,899 ms` / `5,464 ms` in the isolated benchmark loop) delivers an **~8×–10× speedup** while preserving the exact **12/12 (`100.0%`)** accuracy.
-  2. **Tree Attention vs. JSON Generation:** On GPU at $Q = 12$ (`0.5B`), `1a. Tree Prefill` (`574.8 ms`) is **26.2× faster** than autoregressive JSON `.generate()` (`15,074.1 ms`), and the full multi-token `TreeEngine.predict()` (`1,862.0 ms`) is **8.10× faster** than JSON generation.
-  3. **Why Modern Tensor-Core GPUs (T4, L4, RTX 4090, A100) Scale Even Further:** The `Quadro P1000` is a 4 GB mobile Pascal GPU (`sm_61`, 2017) with no Tensor Cores. Because Tree Attention converts $Q$ separate queries and 72 sequential decode steps into a single dense matrix-matrix (`GEMM`) operation, Tensor-Core GPUs accelerate `TreeEngine` into the **`30–180 ms`** range while autoregressive `.generate()` remains bottlenecked by 72 sequential memory-bandwidth reads.
+  1. **GPU vs. CPU:** On the 12-question story test with `Qwen2.5-1.5B`, moving from CPU (`39,652 ms`) to the local `Quadro P1000` GPU (`3,899 ms` on `test_story_comprehension.py`, or `5,464 ms` inside the isolated benchmark loop) delivers an **~7×–10× speedup** while preserving the same **11 confident passes + 1 borderline pass** (`52.1%` in `fp32`, `51.9%` in `fp16`).
+  2. **Tree Attention vs. JSON Generation:** On GPU at $Q = 12$ (`0.5B`), `1a. Tree Prefill` (`581.2 ms`) is **21.4× faster** than autoregressive JSON `.generate()` (`12,459.7 ms`), and the full multi-token `TreeEngine.predict()` (`1,892.7 ms`) is **6.58× faster** than JSON generation.
+  3. **Why Modern Tensor-Core GPUs (T4, L4, RTX 4090, A100) Should Scale Even Further:** The `Quadro P1000` is a 4 GB mobile Pascal GPU (`sm_61`, 2017) with no Tensor Cores. Because Tree Attention converts $Q$ separate queries and 72 sequential decode steps into dense matrix-matrix (`GEMM`) operations, we expect modern Tensor-Core GPUs to widen the speedup over memory-bandwidth-bound `.generate()` even further—though we have only benchmarked our local CPU and `Quadro P1000` so far.
 
 ---
 
@@ -430,7 +430,7 @@ We also tagged each of the 35 scored questions along two axes:
 
 ## 9. How to Run and Test Everything Yourself
 
-The full codebase (Track 1, Track 2, speed benchmarks, training scripts, and all 30 unit tests) is open-source under the **MIT License**:
+The full codebase (Track 1, Track 2, speed benchmarks, training scripts, and all 33 unit tests) is open-source under the **MIT License**:
 
 ```bash
 git clone https://github.com/Akintunde102/pada.git
@@ -477,7 +477,7 @@ python scripts/train_colab_1_5b.py
 python scripts/server.py
 ```
 
-### Way 5: Run the Unit Test Suites (30 Tests: 12 Schema + 18 Tree Engine)
+### Way 5: Run the Unit Test Suites (33 Tests: 12 Schema + 21 Tree Engine)
 ```bash
 python tests/test_schema.py
 python -m unittest discover -s tests -p "test_tree_*.py"
@@ -529,4 +529,5 @@ python -m unittest discover -s tests -p "test_tree_*.py"
   * Yao et al. (2024), *"DeFT: Decoding with Flash Tree-Attention for Efficient Tree-Structured LLM Inference"*.
   * Zheng et al. (2024), *"SGLang: Efficient Execution of Structured Language Model Programs"* (RadixAttention).
   * Cai et al. (2024), *"Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"*.
+  * Gloeckle et al. (2024), *"Better & Faster Large Language Models via Multi-token Prediction"* (ICML 2024) & DeepSeek-AI (2024), *"DeepSeek-V3 Technical Report"* (Multi-Token Prediction / MTP).
   * PyTorch Blog, *"FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention"*.

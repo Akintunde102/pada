@@ -64,7 +64,7 @@ docs/
 └── JEV_IMPLEMENTATION_GUIDE.md    # Track 1 architecture & training reference
 tests/
 ├── test_schema.py                 # 12 unit tests for schema, key stripping & synthetic billing
-└── test_tree_*.py                 # 18 unit tests for tree builder, masks, cache & modes
+└── test_tree_*.py                 # 21 unit tests for tree builder, masks, cache & modes
 ```
 
 ---
@@ -91,7 +91,7 @@ export PYTHONPATH="."
 pip install torch transformers accelerate peft fastapi uvicorn nltk
 ```
 
-### 2. Run the Unit Test Suites (30 Tests, ~0.1s)
+### 2. Run the Unit Test Suites (33 Tests, ~0.2s)
 
 ```bash
 python tests/test_schema.py
@@ -143,10 +143,10 @@ Both Constrained Mode (`score_all_constrained_fused`) and Open Mode (`complete_a
 
 | Pipeline Stage (`TreeEngine.predict()`) | What Happens Inside This Stage | GPU Time (`ms`) | Share of Total |
 | :--- | :--- | :--- | :--- |
-| **Pass 1 (`pack_guided_tree`)** | Encodes shared story + all 12 question branches in 1 4D Tree Attention pass; extracts single-token logits & `tree_kv` | **576.9 ms** (`48 ms/q`) | **31.0%** |
-| **Pass 2a (`score_all_constrained_fused`)** | Scores all candidate tokens + $P(\text{stop})$ across all 7 Constrained & NOUL questions in 1 fused pass on `tree_kv` | **282.7 ms** (`40 ms/q`) | **15.2%** |
-| **Pass 2b (`complete_all_open_fused`)** | Completes multi-token BPE subwords (`'Ġc' + 'ello'`) + $P(\text{stop})$ across all 5 Open Mode questions on `tree_kv` | **1,002.4 ms** (`200 ms/q`) | **53.8%** |
-| **Full `TreeEngine.predict()` Total** | **All 12 questions (5 Open + 3 Choice + 4 NOUL) + 2D OOD scoring** | **1,862.0 ms** (`155 ms/q`) | **100.0%** |
+| **Pass 1 (`pack_guided_tree`)** | Encodes shared story + all 12 question branches in 1 4D Tree Attention pass; extracts single-token logits & `tree_kv` | **589.6 ms** (`49 ms/q`) | **29.4%** |
+| **Pass 2a (`score_all_constrained_fused`)** | Scores all candidate tokens + $P(\text{stop})$ across all 7 Constrained & NOUL questions in 1 fused pass on `tree_kv` | **354.3 ms** (`51 ms/q`) | **17.7%** |
+| **Pass 2b (`complete_all_open_fused`)** | Completes multi-token BPE subwords (`'Ġc' + 'ello'`) + $P(\text{stop})$ across all 5 Open Mode questions on `tree_kv` | **1,062.3 ms** (`212 ms/q`) | **52.9%** |
+| **Full `TreeEngine.predict()` Total** | **All 12 questions (5 Open + 3 Choice + 4 NOUL) + 2D OOD scoring** | **2,006.2 ms** (`167 ms/q`) | **100.0%** |
 
 ### 2. End-to-End Speed Comparison: Packed Tree vs. Sequential Calls vs. JSON `.generate()`
 * **1a. Tree Prefill (`pack_guided_tree`):** Pass 1 shared-trunk forward pass.
@@ -156,9 +156,9 @@ Both Constrained Mode (`score_all_constrained_fused`) and Open Mode (`complete_a
 
 | Hardware & Model ($Q$ Questions) | 1a. Tree Prefill | 1b. Full `TreeEngine` | 2. $Q$ Sequential Calls | 3. JSON `.generate()` | Full Engine Speedup |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GPU `Quadro P1000` — `0.5B` ($Q = 4$)** | **395.5 ms** (`99 ms/q`) | **1,362.3 ms** (`341 ms/q`) | 1,616.4 ms (`404 ms/q`) | 4,613.7 ms (`24 tok`) | **1.19× vs. Seq** (`3.39× vs. JSON`) |
-| **GPU `Quadro P1000` — `0.5B` ($Q = 8$)** | **480.6 ms** (`60 ms/q`) | **1,762.1 ms** (`220 ms/q`) | 3,197.8 ms (`400 ms/q`) | 8,794.5 ms (`48 tok`) | **1.81× vs. Seq** (`4.99× vs. JSON`) |
-| **GPU `Quadro P1000` — `0.5B` ($Q = 12$)** | **574.8 ms** (`48 ms/q`) | **1,862.0 ms** (`155 ms/q`) | 4,619.3 ms (`385 ms/q`) | 15,074.1 ms (`72 tok`) | **2.48× vs. Seq** (**8.10× vs. JSON**) |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 4$)** | **414.2 ms** (`104 ms/q`) | **1,730.9 ms** (`433 ms/q`) | 1,860.3 ms (`465 ms/q`) | 4,522.8 ms (`24 tok`) | **1.07× vs. Seq** (`2.61× vs. JSON`) |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 8$)** | **481.4 ms** (`60 ms/q`) | **1,842.0 ms** (`230 ms/q`) | 3,526.1 ms (`441 ms/q`) | 8,726.1 ms (`48 tok`) | **1.91× vs. Seq** (`4.74× vs. JSON`) |
+| **GPU `Quadro P1000` — `0.5B` ($Q = 12$)** | **581.2 ms** (`48 ms/q`) | **1,892.7 ms** (`158 ms/q`) | 4,726.7 ms (`394 ms/q`) | 12,459.7 ms (`72 tok`) | **2.50× vs. Seq** (**6.58× vs. JSON**) |
 | **GPU `Quadro P1000` — `1.5B` ($Q = 12$)** | **4,971.3 ms** (`414 ms/q`) | **5,464.3 ms** (`455 ms/q`) | 28,938.3 ms (`2,412 ms/q`) | 17,012.7 ms (`72 tok`) | **5.30× vs. Seq** (**3.11× vs. JSON**) |
 | **CPU `float32` — `0.5B` ($Q = 12$)** | **3,620.4 ms** (`302 ms/q`) | **6,714.2 ms** (`560 ms/q`) | 26,225.8 ms (`2,185 ms/q`) | 14,354.6 ms (`72 tok`) | **3.91× vs. Seq** (**2.14× vs. JSON**) |
 
